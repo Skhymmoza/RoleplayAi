@@ -416,6 +416,15 @@ body { height: 100%; margin: 0; background: var(--bg); color: var(--tx); font-fa
 
 .hidden { display: none !important; }
 
+/* typewriter streaming cursor */
+.stream-cursor {
+  display: inline-block; width: 2px; height: 1em;
+  background: var(--ac2); margin-left: 2px;
+  vertical-align: text-bottom; border-radius: 1px;
+  animation: blink .7s steps(1) infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
 @media (max-width: 899px) {
   .hbtn-label { display: none; }
   .msg { max-width: 92%; }
@@ -442,6 +451,8 @@ body { height: 100%; margin: 0; background: var(--bg); color: var(--tx); font-fa
     <button class="panel-close" onclick="closePanel()">×</button>
   </div>
   <div id="charList"></div>
+  <input type="file" id="jsonImportFile" accept=".json" class="hidden" onchange="importCharJSON(event)">
+  <button class="panel-add" onclick="document.getElementById('jsonImportFile').click()">↑ Загрузить JSON</button>
   <button class="panel-add" onclick="openCreate(); closePanel()">＋ Новый персонаж</button>
 </div>
 
@@ -467,6 +478,7 @@ body { height: 100%; margin: 0; background: var(--bg); color: var(--tx); font-fa
         <div id="hActions">
           <button class="hbtn" onclick="openEdit()">✎ <span class="hbtn-label">Изменить</span></button>
           <button class="hbtn" onclick="exportChat()">↓ <span class="hbtn-label">Экспорт</span></button>
+          <button class="hbtn" onclick="exportCharJSON()" title="Экспорт персонажа в JSON">{ }</button>
           <button class="hbtn" onclick="clearChat()">↺ <span class="hbtn-label">Сброс</span></button>
           <button class="hbtn d" onclick="delCurrent()">✕</button>
         </div>
@@ -595,6 +607,7 @@ body { height: 100%; margin: 0; background: var(--bg); color: var(--tx); font-fa
           <option value="40" selected>40</option>
           <option value="60">60</option>
           <option value="100">100</option>
+          <option value="0">∞ Бесконечность</option>
         </select>
       </div>
 
@@ -699,6 +712,7 @@ function saveSettings(){
   cfg.model=document.getElementById('sModel').value;
   cfg.temp=parseFloat(document.getElementById('sTemp').value);
   cfg.maxMem=parseInt(document.getElementById('sMaxMem').value);
+  if(isNaN(cfg.maxMem)) cfg.maxMem=0;
   persistCfg();
   closeSettings();
   updateKeyBtn();
@@ -763,7 +777,9 @@ function renderMsgs(){
 
 function updateBadge(){
   const h=hists[curId]||[];
-  document.getElementById('memBadge').textContent=h.length?`память: ${h.length} / ${cfg.maxMem} сообщ.`:'';
+  if(!h.length){document.getElementById('memBadge').textContent='';return;}
+  const lim=cfg.maxMem===0?'∞':cfg.maxMem;
+  document.getElementById('memBadge').textContent=`память: ${h.length} / ${lim} сообщ.`;
 }
 
 function countChars(){
@@ -791,7 +807,7 @@ ${c.role?`Роль: ${c.role}\n`:''}${c.personality?`Характер: ${c.perso
 ОБЯЗАТЕЛЬНО: физические действия в *звёздочках*, чувства/эмоции в ~тильдах~, речь обычным текстом. Отвечай на русском, помни весь контекст.`;
 }
 
-async function callAPI(c, messages){
+async function streamAPI(c, messages, onChunk){
   if(!cfg.apiKey) throw new Error('API ключ не указан. Откройте ⚙ Настройки.');
   const r=await fetch(API_URL,{
     method:'POST',
@@ -800,12 +816,30 @@ async function callAPI(c, messages){
       model: cfg.model||'mistral-large-latest',
       messages:[{role:'system',content:buildSys(c)},...messages.map(m=>({role:m.role,content:m.content}))],
       max_tokens:700,
-      temperature:cfg.temp||0.92
+      temperature:cfg.temp||0.92,
+      stream:true
     })
   });
-  const d=await r.json();
-  if(d.error) throw new Error(d.error.message);
-  return d.choices[0].message.content;
+  if(!r.ok){ const t=await r.text(); throw new Error(t); }
+  const reader=r.body.getReader();
+  const dec=new TextDecoder();
+  let full='';
+  while(true){
+    const {done,value}=await reader.read(); if(done) break;
+    const chunk=dec.decode(value,{stream:true});
+    const lines=chunk.split('\n');
+    for(const line of lines){
+      if(!line.startsWith('data:')) continue;
+      const data=line.slice(5).trim();
+      if(data==='[DONE]') break;
+      try{
+        const j=JSON.parse(data);
+        const delta=j.choices?.[0]?.delta?.content||'';
+        if(delta){ full+=delta; onChunk(full); }
+      }catch{}
+    }
+  }
+  return full;
 }
 
 function showTyping(c){
@@ -818,6 +852,29 @@ function showTyping(c){
 function hideTyping(){ document.getElementById('typing')?.remove(); }
 function setBusy(v){ document.getElementById('sendBtn').disabled=v; document.getElementById('regenBtn').disabled=v; }
 
+// Create a streaming AI message bubble and return its content element
+function createStreamBub(c){
+  hideTyping();
+  const msgs=document.getElementById('messages');
+  const wrap=document.createElement('div');
+  wrap.className='msg ai'; wrap.id='streamMsg';
+  wrap.innerHTML=`<div class="m-av">${avHTML(c)}</div><div class="m-bub" id="streamBub"><div class="m-name">${e(c.name)}</div><span id="streamText"></span><span class="stream-cursor" id="streamCursor"></span></div>`;
+  msgs.appendChild(wrap);
+  msgs.scrollTop=msgs.scrollHeight;
+  return document.getElementById('streamText');
+}
+function finalizeStream(c, full, idx){
+  const wrap=document.getElementById('streamMsg');
+  if(!wrap) return;
+  const cursor=document.getElementById('streamCursor');
+  if(cursor) cursor.remove();
+  const bub=document.getElementById('streamBub');
+  if(bub){
+    bub.innerHTML=`<div class="m-name">${e(c.name)}</div>${parse(full)}<div class="msg-actions"><button class="msg-act-btn" onclick="copyMsg(${idx})" title="Копировать">⎘</button><button class="msg-act-btn" onclick="delMsg(${idx})" title="Удалить">✕</button></div>`;
+  }
+  wrap.id='';
+}
+
 async function send(){
   const inp=document.getElementById('msgIn');
   const txt=inp.value.trim(); if(!txt||!curId) return;
@@ -828,34 +885,49 @@ async function send(){
   renderMsgs(); setBusy(true); showTyping(c);
   try{
     const h=hists[curId];
-    const tr=h.length>cfg.maxMem?h.slice(h.length-cfg.maxMem):h;
-    const reply=await callAPI(c, tr);
+    const tr=(cfg.maxMem===0||!cfg.maxMem)?h:(h.length>cfg.maxMem?h.slice(h.length-cfg.maxMem):h);
+    const textEl=createStreamBub(c);
+    const msgs=document.getElementById('messages');
+    const reply=await streamAPI(c, tr, (partial)=>{
+      textEl.innerHTML=e(partial).replace(/\n/g,'<br>');
+      msgs.scrollTop=msgs.scrollHeight;
+    });
+    const newIdx=hists[curId].length;
     hists[curId].push({role:'assistant',content:reply});
+    finalizeStream(c, reply, newIdx);
     persist();
   }catch(err){
+    hideTyping();
     hists[curId].push({role:'assistant',content:`*ошибка* ~${err.message}~`});
+    renderMsgs();
   }
-  hideTyping(); setBusy(false);
-  renderMsgs(); updateBadge();
+  setBusy(false); updateBadge();
 }
 
 async function regen(){
   if(!curId) return;
   const c=chars.find(x=>x.id===curId); if(!c) return;
   const h=hists[curId]||[];
-  // remove last assistant message
   if(h.length && h[h.length-1].role==='assistant') hists[curId].pop();
   renderMsgs(); setBusy(true); showTyping(c);
   try{
-    const tr=hists[curId].length>cfg.maxMem?hists[curId].slice(hists[curId].length-cfg.maxMem):hists[curId];
-    const reply=await callAPI(c, tr);
+    const tr=(cfg.maxMem===0||!cfg.maxMem)?hists[curId]:(hists[curId].length>cfg.maxMem?hists[curId].slice(hists[curId].length-cfg.maxMem):hists[curId]);
+    const textEl=createStreamBub(c);
+    const msgs=document.getElementById('messages');
+    const reply=await streamAPI(c, tr, (partial)=>{
+      textEl.innerHTML=e(partial).replace(/\n/g,'<br>');
+      msgs.scrollTop=msgs.scrollHeight;
+    });
+    const newIdx=hists[curId].length;
     hists[curId].push({role:'assistant',content:reply});
+    finalizeStream(c, reply, newIdx);
     persist();
   }catch(err){
+    hideTyping();
     hists[curId].push({role:'assistant',content:`*ошибка* ~${err.message}~`});
+    renderMsgs();
   }
-  hideTyping(); setBusy(false);
-  renderMsgs(); updateBadge();
+  setBusy(false); updateBadge();
 }
 
 function exportChat(){
@@ -951,6 +1023,51 @@ function pickEmoji(em){
   selEmoji=em; avData=null;
   document.getElementById('avPrev').innerHTML=em;
   document.getElementById('emojiGrid').classList.add('hidden');
+}
+
+/* JSON IMPORT / EXPORT */
+function importCharJSON(ev){
+  const f=ev.target.files[0]; if(!f) return;
+  ev.target.value='';
+  const r=new FileReader();
+  r.onload=e2=>{
+    try{
+      let data=JSON.parse(e2.target.result);
+      // accept single object or array
+      const list=Array.isArray(data)?data:[data];
+      let added=0;
+      for(const raw of list){
+        if(!raw.name) continue;
+        const nc={
+          id: Date.now().toString()+Math.random().toString(36).slice(2),
+          name: raw.name||'',
+          role: raw.role||raw.description||'',
+          personality: raw.personality||raw.char_persona||raw.character||'',
+          appearance: raw.appearance||'',
+          scenario: raw.scenario||raw.world_scenario||raw.char_greeting||'',
+          style: raw.style||'casual',
+          greeting: raw.greeting||raw.first_mes||'',
+          avImg: raw.avImg||null,
+          avEmoji: raw.avEmoji||'🎭'
+        };
+        chars.push(nc); added++;
+      }
+      if(added){ persist(); renderList(); toast(`Загружено персонажей: ${added} ✓`); }
+      else toast('Не найдено подходящих персонажей');
+    }catch(err){ toast('Ошибка разбора JSON: '+err.message); }
+  };
+  r.readAsText(f);
+}
+
+function exportCharJSON(){
+  if(!curId) return;
+  const c=chars.find(x=>x.id===curId); if(!c) return;
+  const blob=new Blob([JSON.stringify(c,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`char_${c.name}_${Date.now()}.json`;
+  a.click(); URL.revokeObjectURL(a.href);
+  toast('Персонаж экспортирован ✓');
 }
 
 load(); renderList(); updateKeyBtn();
